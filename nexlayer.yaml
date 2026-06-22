@@ -1,0 +1,30 @@
+application:
+  name: windmill
+  pods:
+  - name: server
+    image: ghcr.io/windmill-labs/windmill:main
+    path: /
+    servicePorts:
+    - 8000
+    vars:
+      DATABASE_URL: "postgres://windmill:windmill@postgres.pod:5432/windmill"
+      BASE_URL: "https://relaxed-weasel-windmill.cloud.nexlayer.ai"
+      BASE_INTERNAL_URL: "http://server.pod:8000"
+      MODE: "server"
+      JWT_SECRET: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+    volumes:
+    - name: windmill-worker-logs
+      mountPath: /tmp/windmill/logs
+      size: 2Gi
+  - name: postgres
+    image: postgres:16-alpine
+    servicePorts:
+    - 5432
+    vars:
+      POSTGRES_DB: windmill
+      POSTGRES_USER: windmill
+      POSTGRES_PASSWORD: windmill
+    volumes:
+    - name: windmill-db
+      mountPath: /var/lib/postgresql/data
+      size: 5Gi
