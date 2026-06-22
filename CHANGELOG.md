@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.735.1](https://github.com/windmill-labs/windmill/compare/v1.735.0...v1.735.1) (2026-06-22)
+
+
+### Bug Fixes
+
+* **frontend:** destroy old WebsocketProvider on workspace switch in MultiplayerMenu ([#9719](https://github.com/windmill-labs/windmill/issues/9719)) ([6e96f90](https://github.com/windmill-labs/windmill/commit/6e96f90065dfe2f6ccc5eb4f85f4facd3515c70c))
+* **frontend:** ensure type:object in test_run_flow tool schema for Anthropic ([#9721](https://github.com/windmill-labs/windmill/issues/9721)) ([d5cb944](https://github.com/windmill-labs/windmill/commit/d5cb944cf92f074b2ee42c876595eacdfa2f4d76))
+* re-enforce scoped API token boundaries across handlers ([#9712](https://github.com/windmill-labs/windmill/issues/9712)) ([e19594d](https://github.com/windmill-labs/windmill/commit/e19594df2ad015a0336ade95e04562f5562ec3f6))
+
 ## [1.735.0](https://github.com/windmill-labs/windmill/compare/v1.734.0...v1.735.0) (2026-06-22)
 
 
