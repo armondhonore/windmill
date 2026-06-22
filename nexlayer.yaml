@@ -17,7 +17,7 @@ application:
       mountPath: /tmp/windmill/logs
       size: 2Gi
   - name: postgres
-    image: postgres:16-alpine
+    image: mirror.gcr.io/library/postgres:16-alpine
     servicePorts:
     - 5432
     vars:
