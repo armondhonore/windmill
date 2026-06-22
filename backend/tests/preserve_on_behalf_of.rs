@@ -2808,3 +2808,150 @@ async fn test_schedule_permissions_superadmin_not_in_workspace(
 
     Ok(())
 }
+
+// ============================================================================
+// Security regression — preserved app on_behalf_of must be validated
+// ============================================================================
+// A wm_deployers member supplies on_behalf_of / on_behalf_of_email verbatim
+// when preserving. Without validation, setting on_behalf_of_email to the
+// superadmin sentinel `superadmin_secret@windmill.dev` makes the app execute
+// with instance-superadmin privileges. Create and update must reject the
+// sentinel, mismatched emails, and unknown principals; the legitimate
+// "preserve a real author" flow must still succeed.
+
+const SUPERADMIN_SENTINEL_EMAIL: &str = "superadmin_secret@windmill.dev";
+
+#[sqlx::test(fixtures("preserve_on_behalf_of"))]
+async fn test_app_preserve_on_behalf_of_rejects_invalid_identity(
+    db: Pool<Postgres>,
+) -> anyhow::Result<()> {
+    initialize_tracing().await;
+
+    let server = ApiServer::start(db.clone()).await?;
+    let port = server.addr.port();
+    let base = format!("http://localhost:{port}/api/w/test-workspace");
+
+    // The exact attack: a deployer stores the superadmin sentinel as the app's
+    // run-as identity. `superadmin-external` is a superadmin in `password` but
+    // not in `usr`, so its u/ form does not exist in the workspace either.
+    let sentinel_cases: &[(&str, Option<&str>, &str)] = &[
+        // (on_behalf_of, on_behalf_of_email, description)
+        (
+            "u/superadmin-external",
+            Some(SUPERADMIN_SENTINEL_EMAIL),
+            "superadmin sentinel email",
+        ),
+        (
+            "u/original-user",
+            Some(SUPERADMIN_SENTINEL_EMAIL),
+            "sentinel email pinned onto a real user",
+        ),
+        (
+            "u/original-user",
+            Some("test2@windmill.dev"),
+            "email of a different real user",
+        ),
+        (
+            "u/ghost",
+            Some("ghost@windmill.dev"),
+            "user that does not exist in the workspace",
+        ),
+    ];
+
+    for (i, (obo, obo_email, desc)) in sentinel_cases.iter().enumerate() {
+        let resp = authed(
+            client().post(format!("{base}/apps/create")),
+            "DEPLOYER_TOKEN",
+        )
+        .json(&new_app_with_on_behalf_of(
+            &format!("u/deployer-user/app_reject_{i}"),
+            Some(obo),
+            *obo_email,
+            true,
+        ))
+        .send()
+        .await?;
+        assert_eq!(
+            resp.status(),
+            400,
+            "create with {desc} must be rejected, got: {}",
+            resp.text().await?
+        );
+
+        // Nothing must be persisted for a rejected create.
+        let exists = sqlx::query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM app WHERE path = $1 AND workspace_id = $2)",
+            format!("u/deployer-user/app_reject_{i}"),
+            "test-workspace"
+        )
+        .fetch_one(&db)
+        .await?
+        .unwrap_or(false);
+        assert!(!exists, "rejected create ({desc}) must not persist an app");
+    }
+
+    // The legitimate flow — preserving a real author — still works.
+    let resp = authed(
+        client().post(format!("{base}/apps/create")),
+        "DEPLOYER_TOKEN",
+    )
+    .json(&new_app_with_on_behalf_of(
+        "u/deployer-user/app_legit_preserve",
+        Some("u/original-user"),
+        Some("original@windmill.dev"),
+        true,
+    ))
+    .send()
+    .await?;
+    assert_eq!(
+        resp.status(),
+        201,
+        "legitimate preserve of a real author must still succeed: {}",
+        resp.text().await?
+    );
+
+    // Update must reject the sentinel just like create. Start from the
+    // legitimately-stored app and try to escalate it.
+    let resp = authed(
+        client().post(format!(
+            "{base}/apps/update/u/deployer-user/app_legit_preserve"
+        )),
+        "DEPLOYER_TOKEN",
+    )
+    .json(&json!({
+        "summary": "escalation attempt",
+        "policy": {
+            "execution_mode": "anonymous",
+            "triggerables": {},
+            "on_behalf_of": "u/superadmin-external",
+            "on_behalf_of_email": SUPERADMIN_SENTINEL_EMAIL
+        },
+        "preserve_on_behalf_of": true
+    }))
+    .send()
+    .await?;
+    assert_eq!(
+        resp.status(),
+        400,
+        "update with the superadmin sentinel must be rejected: {}",
+        resp.text().await?
+    );
+
+    // The stored policy must be untouched by the rejected update.
+    let app = sqlx::query!(
+        "SELECT policy FROM app WHERE path = $1 AND workspace_id = $2",
+        "u/deployer-user/app_legit_preserve",
+        "test-workspace"
+    )
+    .fetch_one(&db)
+    .await?;
+    assert_eq!(
+        app.policy
+            .get("on_behalf_of_email")
+            .and_then(|v| v.as_str()),
+        Some("original@windmill.dev"),
+        "rejected update must not overwrite the stored on_behalf_of_email"
+    );
+
+    Ok(())
+}

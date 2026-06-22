@@ -1372,6 +1372,24 @@ async fn create_app_internal<'a>(
         && windmill_common::can_preserve_on_behalf_of(&authed)
         && app.policy.on_behalf_of.is_some();
 
+    if should_preserve {
+        // The deployer-supplied on_behalf_of identity is stored verbatim here;
+        // validate it refers to a real workspace principal and not a reserved
+        // superadmin sentinel before persisting it.
+        let permissioned_as = app.policy.on_behalf_of.as_deref().unwrap_or_default();
+        let obo_email = app.policy.on_behalf_of_email.as_deref().ok_or_else(|| {
+            Error::BadRequest(
+                "on_behalf_of_email is required when preserving on_behalf_of".to_string(),
+            )
+        })?;
+        windmill_common::users::validate_preserved_on_behalf_of(
+            &db,
+            w_id,
+            permissioned_as,
+            obo_email,
+        )
+        .await?;
+    }
     if !should_preserve {
         let folder_default = if windmill_common::can_preserve_on_behalf_of(&authed) {
             windmill_common::folders::resolve_folder_default_permissioned_as(&db, w_id, &app.path)
@@ -2003,10 +2021,24 @@ async fn update_app_internal<'a>(
                 && npolicy.on_behalf_of.is_some();
 
             if should_preserve {
-                if let Some(ref obo_email) = npolicy.on_behalf_of_email {
-                    if obo_email != &authed.email {
-                        preserved_on_behalf_of = Some(obo_email.clone());
-                    }
+                // The deployer-supplied on_behalf_of identity is stored verbatim
+                // here; validate it refers to a real workspace principal and not
+                // a reserved superadmin sentinel before persisting it.
+                let permissioned_as = npolicy.on_behalf_of.as_deref().unwrap_or_default();
+                let obo_email = npolicy.on_behalf_of_email.as_deref().ok_or_else(|| {
+                    Error::BadRequest(
+                        "on_behalf_of_email is required when preserving on_behalf_of".to_string(),
+                    )
+                })?;
+                windmill_common::users::validate_preserved_on_behalf_of(
+                    &db,
+                    w_id,
+                    permissioned_as,
+                    obo_email,
+                )
+                .await?;
+                if obo_email != authed.email {
+                    preserved_on_behalf_of = Some(obo_email.to_string());
                 }
             } else {
                 npolicy.on_behalf_of = Some(username_to_permissioned_as(&authed.username));
@@ -3357,6 +3389,14 @@ fn get_on_behalf_of(policy: &Policy) -> Result<(String, String)> {
             )
         })?
         .to_string();
+    // Defense in depth: a stored policy must never resolve to a reserved
+    // superadmin sentinel, which would mint a superadmin job token at execution
+    // regardless of how the policy was written.
+    if windmill_common::users::is_reserved_superadmin_email(&email) {
+        return Err(Error::internal_err(
+            "app on_behalf_of_email resolves to a reserved identity".to_string(),
+        ));
+    }
     Ok((permissioned_as, email))
 }
 

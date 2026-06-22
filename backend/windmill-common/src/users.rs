@@ -81,6 +81,81 @@ pub async fn get_email_from_permissioned_as(
     }
 }
 
+/// The reserved superadmin sentinel emails. `fetch_authed_from_permissioned_as`
+/// grants `is_super_admin` for any of these *without* a `usr`/`password` lookup,
+/// so they are an instance-superadmin backdoor and must never be reachable
+/// through a caller-supplied or stored run-as identity.
+pub fn is_reserved_superadmin_email(email: &str) -> bool {
+    email == SUPERADMIN_SECRET_EMAIL
+        || email == SUPERADMIN_SYNC_EMAIL
+        || email == SUPERADMIN_NOTIFICATION_EMAIL
+}
+
+/// Validate a preserved `on_behalf_of` / `on_behalf_of_email` pair before it is
+/// persisted in an app policy. A `wm_deployers` member can supply this pair
+/// verbatim when preserving an app's run-as identity; without validation they
+/// could set `on_behalf_of_email` to a reserved superadmin sentinel and have the
+/// app execute with instance-superadmin privileges. The pair must therefore
+/// reference a real user/group in the workspace whose canonical email matches,
+/// mirroring [`get_email_from_permissioned_as`].
+pub async fn validate_preserved_on_behalf_of(
+    db: &sqlx::Pool<sqlx::Postgres>,
+    workspace_id: &str,
+    permissioned_as: &str,
+    on_behalf_of_email: &str,
+) -> crate::error::Result<()> {
+    if is_reserved_superadmin_email(on_behalf_of_email) {
+        return Err(crate::error::Error::BadRequest(format!(
+            "on_behalf_of_email '{on_behalf_of_email}' is reserved and cannot be used as a run-as identity"
+        )));
+    }
+    if let Some(username) = permissioned_as.strip_prefix(PERMISSIONED_AS_USER_PREFIX) {
+        let actual_email = sqlx::query_scalar!(
+            "SELECT email FROM usr WHERE username = $1 AND workspace_id = $2",
+            username,
+            workspace_id
+        )
+        .fetch_optional(db)
+        .await?;
+        match actual_email {
+            None => Err(crate::error::Error::BadRequest(format!(
+                "on_behalf_of user '{permissioned_as}' does not exist in workspace '{workspace_id}'"
+            ))),
+            Some(actual_email) if actual_email != on_behalf_of_email => {
+                Err(crate::error::Error::BadRequest(format!(
+                    "on_behalf_of_email '{on_behalf_of_email}' does not match user '{permissioned_as}'"
+                )))
+            }
+            Some(_) => Ok(()),
+        }
+    } else if let Some(group) = permissioned_as.strip_prefix(PERMISSIONED_AS_GROUP_PREFIX) {
+        let exists = sqlx::query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM group_ WHERE workspace_id = $1 AND name = $2)",
+            workspace_id,
+            group
+        )
+        .fetch_one(db)
+        .await?
+        .unwrap_or(false);
+        if !exists {
+            return Err(crate::error::Error::BadRequest(format!(
+                "on_behalf_of group '{permissioned_as}' does not exist in workspace '{workspace_id}'"
+            )));
+        }
+        let expected_email = format!("{}{}@windmill.dev", USERNAME_GROUP_PREFIX, group);
+        if on_behalf_of_email != expected_email {
+            return Err(crate::error::Error::BadRequest(format!(
+                "on_behalf_of_email '{on_behalf_of_email}' does not match group '{permissioned_as}'"
+            )));
+        }
+        Ok(())
+    } else {
+        Err(crate::error::Error::BadRequest(format!(
+            "on_behalf_of '{permissioned_as}' must reference a user ('u/<username>') or group ('g/<group>')"
+        )))
+    }
+}
+
 /// Compute the highest-precedence workspace role for a user across all their instance groups.
 ///
 /// Precedence: admin (3) > developer (2) > operator (1).
