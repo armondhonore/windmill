@@ -3390,11 +3390,14 @@ fn get_on_behalf_of(policy: &Policy) -> Result<(String, String)> {
         })?
         .to_string();
     // Defense in depth: a stored policy must never resolve to a reserved
-    // superadmin sentinel, which would mint a superadmin job token at execution
-    // regardless of how the policy was written.
-    if windmill_common::users::is_reserved_superadmin_email(&email) {
+    // superadmin sentinel before execution. fetch_authed_from_permissioned_as
+    // grants superadmin when either the email or the permissioned_as matches a
+    // sentinel, so guard both regardless of how the policy was written.
+    if windmill_common::users::is_reserved_superadmin_email(&email)
+        || windmill_common::users::is_reserved_superadmin_email(&permissioned_as)
+    {
         return Err(Error::internal_err(
-            "app on_behalf_of_email resolves to a reserved identity".to_string(),
+            "app on_behalf_of resolves to a reserved identity".to_string(),
         ));
     }
     Ok((permissioned_as, email))
