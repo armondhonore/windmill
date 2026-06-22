@@ -1374,21 +1374,17 @@ async fn create_app_internal<'a>(
 
     if should_preserve {
         // The deployer-supplied on_behalf_of identity is stored verbatim here;
-        // validate it refers to a real workspace principal and not a reserved
-        // superadmin sentinel before persisting it.
+        // it must never be a reserved superadmin sentinel, which would escalate
+        // the app to instance-superadmin at execution.
         let permissioned_as = app.policy.on_behalf_of.as_deref().unwrap_or_default();
-        let obo_email = app.policy.on_behalf_of_email.as_deref().ok_or_else(|| {
-            Error::BadRequest(
-                "on_behalf_of_email is required when preserving on_behalf_of".to_string(),
-            )
-        })?;
-        windmill_common::users::validate_preserved_on_behalf_of(
-            &db,
-            w_id,
+        if windmill_common::users::is_reserved_superadmin_identity(
             permissioned_as,
-            obo_email,
-        )
-        .await?;
+            app.policy.on_behalf_of_email.as_deref(),
+        ) {
+            return Err(Error::BadRequest(
+                "on_behalf_of cannot be a reserved superadmin identity".to_string(),
+            ));
+        }
     }
     if !should_preserve {
         let folder_default = if windmill_common::can_preserve_on_behalf_of(&authed) {
@@ -2022,23 +2018,21 @@ async fn update_app_internal<'a>(
 
             if should_preserve {
                 // The deployer-supplied on_behalf_of identity is stored verbatim
-                // here; validate it refers to a real workspace principal and not
-                // a reserved superadmin sentinel before persisting it.
+                // here; it must never be a reserved superadmin sentinel, which
+                // would escalate the app to instance-superadmin at execution.
                 let permissioned_as = npolicy.on_behalf_of.as_deref().unwrap_or_default();
-                let obo_email = npolicy.on_behalf_of_email.as_deref().ok_or_else(|| {
-                    Error::BadRequest(
-                        "on_behalf_of_email is required when preserving on_behalf_of".to_string(),
-                    )
-                })?;
-                windmill_common::users::validate_preserved_on_behalf_of(
-                    &db,
-                    w_id,
+                if windmill_common::users::is_reserved_superadmin_identity(
                     permissioned_as,
-                    obo_email,
-                )
-                .await?;
-                if obo_email != authed.email {
-                    preserved_on_behalf_of = Some(obo_email.to_string());
+                    npolicy.on_behalf_of_email.as_deref(),
+                ) {
+                    return Err(Error::BadRequest(
+                        "on_behalf_of cannot be a reserved superadmin identity".to_string(),
+                    ));
+                }
+                if let Some(ref obo_email) = npolicy.on_behalf_of_email {
+                    if obo_email != &authed.email {
+                        preserved_on_behalf_of = Some(obo_email.clone());
+                    }
                 }
             } else {
                 npolicy.on_behalf_of = Some(username_to_permissioned_as(&authed.username));
@@ -3390,12 +3384,9 @@ fn get_on_behalf_of(policy: &Policy) -> Result<(String, String)> {
         })?
         .to_string();
     // Defense in depth: a stored policy must never resolve to a reserved
-    // superadmin sentinel before execution. fetch_authed_from_permissioned_as
-    // grants superadmin when either the email or the permissioned_as matches a
-    // sentinel, so guard both regardless of how the policy was written.
-    if windmill_common::users::is_reserved_superadmin_email(&email)
-        || windmill_common::users::is_reserved_superadmin_email(&permissioned_as)
-    {
+    // superadmin sentinel at execution, regardless of how the policy was
+    // written (e.g. a workspace import that bypassed the create/update guard).
+    if windmill_common::users::is_reserved_superadmin_identity(&permissioned_as, Some(&email)) {
         return Err(Error::internal_err(
             "app on_behalf_of resolves to a reserved identity".to_string(),
         ));

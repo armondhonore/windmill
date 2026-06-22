@@ -2810,61 +2810,56 @@ async fn test_schedule_permissions_superadmin_not_in_workspace(
 }
 
 // ============================================================================
-// Security regression — preserved app on_behalf_of must be validated
+// Security regression — preserved app on_behalf_of must reject the sentinel
 // ============================================================================
 // A wm_deployers member supplies on_behalf_of / on_behalf_of_email verbatim
-// when preserving. Without validation, setting on_behalf_of_email to the
-// superadmin sentinel `superadmin_secret@windmill.dev` makes the app execute
-// with instance-superadmin privileges. Create and update must reject the
-// sentinel, mismatched emails, and unknown principals; the legitimate
-// "preserve a real author" flow must still succeed.
+// when preserving. The reserved superadmin sentinel is the only identity that
+// escalates the app to instance-superadmin at execution, so create and update
+// must reject it (via either field). Everything else — including stale,
+// mismatched, raw-email, and null-email authors — must still be accepted so
+// legacy apps keep redeploying through git-sync/CLI (which re-send the stored
+// identity with preserve_on_behalf_of on every push).
 
-const SUPERADMIN_SENTINEL_EMAIL: &str = "superadmin_secret@windmill.dev";
+const SUPERADMIN_SECRET_EMAIL: &str = "superadmin_secret@windmill.dev";
+const SUPERADMIN_SYNC_EMAIL: &str = "superadmin_sync@windmill.dev";
 
 #[sqlx::test(fixtures("preserve_on_behalf_of"))]
-async fn test_app_preserve_on_behalf_of_rejects_invalid_identity(
-    db: Pool<Postgres>,
-) -> anyhow::Result<()> {
+async fn test_app_preserve_on_behalf_of_rejects_sentinel(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
 
     let server = ApiServer::start(db.clone()).await?;
     let port = server.addr.port();
     let base = format!("http://localhost:{port}/api/w/test-workspace");
 
-    // The exact attack: a deployer stores the superadmin sentinel as the app's
-    // run-as identity. `superadmin-external` is a superadmin in `password` but
-    // not in `usr`, so its u/ form does not exist in the workspace either.
+    // The escalation: a deployer pins a reserved superadmin sentinel onto the
+    // app's run-as identity, via the email field or the permissioned_as field.
     let sentinel_cases: &[(&str, Option<&str>, &str)] = &[
         // (on_behalf_of, on_behalf_of_email, description)
         (
             "u/superadmin-external",
-            Some(SUPERADMIN_SENTINEL_EMAIL),
-            "superadmin sentinel email",
+            Some(SUPERADMIN_SECRET_EMAIL),
+            "secret sentinel as email",
         ),
         (
             "u/original-user",
-            Some(SUPERADMIN_SENTINEL_EMAIL),
+            Some(SUPERADMIN_SECRET_EMAIL),
             "sentinel email pinned onto a real user",
         ),
         (
-            "u/original-user",
-            Some("test2@windmill.dev"),
-            "email of a different real user",
-        ),
-        (
-            "u/ghost",
-            Some("ghost@windmill.dev"),
-            "user that does not exist in the workspace",
+            SUPERADMIN_SYNC_EMAIL,
+            Some("original@windmill.dev"),
+            "sync sentinel as permissioned_as",
         ),
     ];
 
     for (i, (obo, obo_email, desc)) in sentinel_cases.iter().enumerate() {
+        let path = format!("u/deployer-user/app_reject_{i}");
         let resp = authed(
             client().post(format!("{base}/apps/create")),
             "DEPLOYER_TOKEN",
         )
         .json(&new_app_with_on_behalf_of(
-            &format!("u/deployer-user/app_reject_{i}"),
+            &path,
             Some(obo),
             *obo_email,
             true,
@@ -2881,7 +2876,7 @@ async fn test_app_preserve_on_behalf_of_rejects_invalid_identity(
         // Nothing must be persisted for a rejected create.
         let exists = sqlx::query_scalar!(
             "SELECT EXISTS(SELECT 1 FROM app WHERE path = $1 AND workspace_id = $2)",
-            format!("u/deployer-user/app_reject_{i}"),
+            path,
             "test-workspace"
         )
         .fetch_one(&db)
@@ -2890,32 +2885,74 @@ async fn test_app_preserve_on_behalf_of_rejects_invalid_identity(
         assert!(!exists, "rejected create ({desc}) must not persist an app");
     }
 
-    // The legitimate flow — preserving a real author — still works.
-    let resp = authed(
-        client().post(format!("{base}/apps/create")),
-        "DEPLOYER_TOKEN",
-    )
-    .json(&new_app_with_on_behalf_of(
-        "u/deployer-user/app_legit_preserve",
-        Some("u/original-user"),
-        Some("original@windmill.dev"),
-        true,
-    ))
-    .send()
-    .await?;
-    assert_eq!(
-        resp.status(),
-        201,
-        "legitimate preserve of a real author must still succeed: {}",
-        resp.text().await?
-    );
+    // Non-sentinel identities must NOT be rejected, even when they are stale or
+    // unusual — rejecting these would break redeploys of pre-existing apps.
+    let allowed_cases: &[(&str, Option<&str>, &str)] = &[
+        (
+            "u/original-user",
+            Some("original@windmill.dev"),
+            "real author (the common case)",
+        ),
+        (
+            "u/ghost",
+            Some("ghost@windmill.dev"),
+            "author since removed from the workspace",
+        ),
+        (
+            "u/original-user",
+            Some("stale@windmill.dev"),
+            "author whose email no longer matches",
+        ),
+        (
+            "admin@company.com",
+            Some("admin@company.com"),
+            "raw-email author (instance superadmin not in usr)",
+        ),
+        (
+            "u/original-user",
+            None,
+            "legacy app with no on_behalf_of_email",
+        ),
+    ];
 
-    // Update must reject the sentinel just like create. Start from the
-    // legitimately-stored app and try to escalate it.
+    for (i, (obo, obo_email, desc)) in allowed_cases.iter().enumerate() {
+        let path = format!("u/deployer-user/app_allow_{i}");
+        let resp = authed(
+            client().post(format!("{base}/apps/create")),
+            "DEPLOYER_TOKEN",
+        )
+        .json(&new_app_with_on_behalf_of(
+            &path,
+            Some(obo),
+            *obo_email,
+            true,
+        ))
+        .send()
+        .await?;
+        assert_eq!(
+            resp.status(),
+            201,
+            "create preserving {desc} must succeed, got: {}",
+            resp.text().await?
+        );
+        // The preserved identity is stored verbatim.
+        let app = sqlx::query!(
+            "SELECT policy FROM app WHERE path = $1 AND workspace_id = $2",
+            path,
+            "test-workspace"
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(
+            app.policy.get("on_behalf_of").and_then(|v| v.as_str()),
+            Some(*obo),
+            "{desc}: on_behalf_of must be preserved as-is"
+        );
+    }
+
+    // Update must reject the sentinel too. Escalate the legit app from above.
     let resp = authed(
-        client().post(format!(
-            "{base}/apps/update/u/deployer-user/app_legit_preserve"
-        )),
+        client().post(format!("{base}/apps/update/u/deployer-user/app_allow_0")),
         "DEPLOYER_TOKEN",
     )
     .json(&json!({
@@ -2924,7 +2961,7 @@ async fn test_app_preserve_on_behalf_of_rejects_invalid_identity(
             "execution_mode": "anonymous",
             "triggerables": {},
             "on_behalf_of": "u/superadmin-external",
-            "on_behalf_of_email": SUPERADMIN_SENTINEL_EMAIL
+            "on_behalf_of_email": SUPERADMIN_SECRET_EMAIL
         },
         "preserve_on_behalf_of": true
     }))
@@ -2940,7 +2977,7 @@ async fn test_app_preserve_on_behalf_of_rejects_invalid_identity(
     // The stored policy must be untouched by the rejected update.
     let app = sqlx::query!(
         "SELECT policy FROM app WHERE path = $1 AND workspace_id = $2",
-        "u/deployer-user/app_legit_preserve",
+        "u/deployer-user/app_allow_0",
         "test-workspace"
     )
     .fetch_one(&db)
